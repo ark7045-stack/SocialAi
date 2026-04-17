@@ -1151,7 +1151,7 @@ async function generatePost() {
     };
   }
 
-  setProgress(35, 'Content ready! Generating image with FLUX…', true);
+  setProgress(35, 'Content ready! Trying image models…', true);
   currentDraft = { ...parsed, id:Date.now(), image:null, status:'draft', platforms:state.selPlats, time:document.getElementById('post-time').value };
   renderDraft(null, null);
 
@@ -1186,24 +1186,47 @@ async function callClaude(system, user) {
   return d.content?.map(c=>c.text||'').join('') || '';
 }
 
+// Multiple models — tries each until one works
+const IMAGE_MODELS = [
+  { id:'stabilityai/stable-diffusion-xl-base-1.0', params:{width:1024,height:1024,num_inference_steps:20,guidance_scale:7.5}, label:'SDXL' },
+  { id:'runwayml/stable-diffusion-v1-5',           params:{width:512,height:512,num_inference_steps:20,guidance_scale:7.5},  label:'SD 1.5' },
+  { id:'stabilityai/stable-diffusion-2-1',         params:{width:768,height:768,num_inference_steps:20,guidance_scale:7.5},  label:'SD 2.1' },
+  { id:'Lykon/dreamshaper-8',                      params:{width:512,height:512,num_inference_steps:20,guidance_scale:7},    label:'DreamShaper' },
+  { id:'black-forest-labs/FLUX.1-schnell',         params:{width:1024,height:1024,num_inference_steps:4},                   label:'FLUX' },
+];
+
 async function genFluxImage(prompt, token) {
-  for (let i=0; i<3; i++) {
-    try {
-      const r = await fetch('https://api-inference.huggingface.co/models/black-forest-labs/FLUX.1-schnell', {
-        method:'POST',
-        headers:{ Authorization:`Bearer ${token.trim()}`, 'Content-Type':'application/json', 'x-wait-for-model':'true' },
-        body: JSON.stringify({ inputs:prompt, parameters:{width:1024,height:1024,num_inference_steps:4} }),
-      });
-      if (r.status === 503) { await sleep(8000); continue; }
-      if (r.status === 401) return {url:null, err:'Invalid token — create a new one at huggingface.co/settings/tokens'};
-      if (r.status === 403) return {url:null, err:'Accept FLUX terms at huggingface.co/black-forest-labs/FLUX.1-schnell'};
-      if (!r.ok) { const t=await r.text(); return {url:null, err:`Error ${r.status}: ${t.substring(0,120)}`}; }
-      const blob = await r.blob();
-      if (blob.size < 500) { if(i<2){await sleep(5000);continue;} return {url:null,err:'Empty response — retry'}; }
-      return {url: URL.createObjectURL(blob), err:null};
-    } catch(e) { if(i===2) return {url:null,err:e.message}; await sleep(4000); }
+  for (const model of IMAGE_MODELS) {
+    setProgress(40, 'Trying ' + model.label + ' model…', true);
+    const result = await tryModel(model, prompt, token);
+    if (result.url) return result;
+    if (result.fatal) return result;
+    await sleep(1500);
   }
-  return {url:null,err:'Max retries exceeded'};
+  return {url:null, err:'All image models failed. Check your HF token has Read permission.'};
+}
+
+async function tryModel(model, prompt, token) {
+  for (let i=0; i<2; i++) {
+    try {
+      const r = await fetch('https://api-inference.huggingface.co/models/' + model.id, {
+        method:'POST',
+        headers:{ Authorization:'Bearer ' + token.trim(), 'Content-Type':'application/json', 'x-wait-for-model':'true' },
+        body: JSON.stringify({ inputs:prompt, parameters: model.params }),
+      });
+      if (r.status === 401) return {url:null, err:'Invalid HF token. Create a new Read token at huggingface.co/settings/tokens', fatal:true};
+      if (r.status === 403) { await sleep(2000); continue; }
+      if (r.status === 503 || r.status === 500) { await sleep(6000); continue; }
+      if (!r.ok) { await sleep(2000); continue; }
+      const blob = await r.blob();
+      if (blob.size < 1000) { await sleep(3000); continue; }
+      return {url: URL.createObjectURL(blob), err:null};
+    } catch(e) {
+      if (i === 1) return {url:null, err:e.message};
+      await sleep(3000);
+    }
+  }
+  return {url:null, err:model.label + ' unavailable'};
 }
 
 async function mergeOnCanvas(userSrc, aiSrc, layout) {
